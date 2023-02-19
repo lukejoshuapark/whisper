@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"crypto/ed25519"
 	"crypto/rand"
-	"net"
 	"sync"
 	"testing"
 
@@ -19,16 +18,10 @@ func TestSecureReadWriterEndToEnd(t *testing.T) {
 	wg := &sync.WaitGroup{}
 	wg.Add(2)
 
+	bp1, bp2 := BufferedPipe()
+
 	go func() {
-		l, err := net.Listen("tcp", ":1")
-		test.That(t, err, is.Nil)
-		defer l.Close()
-
-		conn1, err := l.Accept()
-		test.That(t, err, is.Nil)
-		defer conn1.Close()
-
-		srw1 := NewSecureReadWriterWithPrivateKey(conn1, privateKey)
+		srw1 := NewSecureReadWriterWithPrivateKey(bp1, privateKey)
 
 		_, err = srw1.Write([]byte("Hel"))
 		test.That(t, err, is.Nil)
@@ -53,11 +46,7 @@ func TestSecureReadWriterEndToEnd(t *testing.T) {
 	}()
 
 	go func() {
-		conn2, err := net.Dial("tcp", ":1")
-		test.That(t, err, is.Nil)
-		defer conn2.Close()
-
-		srw2 := NewSecureReadWriterWithPublicKey(conn2, publicKey)
+		srw2 := NewSecureReadWriterWithPublicKey(bp2, publicKey)
 		reader := bufio.NewReader(srw2)
 
 		v1, err := reader.ReadString('\n')
