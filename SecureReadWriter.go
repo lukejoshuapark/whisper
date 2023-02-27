@@ -20,9 +20,11 @@ type SecureReadWriter struct {
 	privateKey ed25519.PrivateKey
 	mx         *sync.RWMutex
 
-	aead  cipher.AEAD
-	nonce []byte
-	buf   []byte
+	sendAEAD     cipher.AEAD
+	receiveAEAD  cipher.AEAD
+	sendNonce    []byte
+	receiveNonce []byte
+	buf          []byte
 }
 
 var _ io.ReadWriter = &SecureReadWriter{}
@@ -100,10 +102,12 @@ func (srw *SecureReadWriter) Read(p []byte) (int, error) {
 		return max, nil
 	}
 
-	plaintext, err := decrypt(srw.aead, srw.rw)
+	plaintext, err := decrypt(srw.receiveAEAD, srw.receiveNonce, srw.rw)
 	if err != nil {
 		return 0, fmt.Errorf("failed to decrypt data: %w", err)
 	}
+
+	increaseNonce(srw.receiveNonce)
 
 	max := len(plaintext)
 	if len(p) < max {
@@ -124,13 +128,13 @@ func (srw *SecureReadWriter) Write(p []byte) (int, error) {
 		return 0, err
 	}
 
-	if err := increaseNonce(srw.nonce); err != nil {
-		return 0, err
-	}
-
-	err := encrypt(srw.aead, srw.nonce, p, srw.rw)
+	err := encrypt(srw.sendAEAD, srw.sendNonce, p, srw.rw)
 	if err != nil {
 		return 0, fmt.Errorf("failed to encrypt data: %w", err)
+	}
+
+	if err := increaseNonce(srw.sendNonce); err != nil {
+		return 0, err
 	}
 
 	return len(p), nil

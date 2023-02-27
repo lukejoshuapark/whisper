@@ -8,12 +8,13 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
 	"fmt"
 	"io"
 )
 
-var bytesMagic = []byte("whspr")
+var bytesMagic = []byte("WHSP")
 var bytesPublicKeyOnly = []byte{0x00}
 var bytesPublicKeyAndSignature = []byte{0x01}
 
@@ -22,7 +23,7 @@ func (srw *SecureReadWriter) performHandshakeIfRequired() error {
 	hasPerformedHandshake := func() bool {
 		srw.mx.RLock()
 		defer srw.mx.RUnlock()
-		return srw.aead != nil
+		return srw.sendAEAD != nil
 	}()
 
 	if hasPerformedHandshake {
@@ -34,7 +35,7 @@ func (srw *SecureReadWriter) performHandshakeIfRequired() error {
 	defer srw.mx.Unlock()
 
 	// 3. Check again to see if another goroutine bet us here.
-	if srw.aead != nil {
+	if srw.sendAEAD != nil {
 		return nil
 	}
 
@@ -98,12 +99,12 @@ func (srw *SecureReadWriter) performHandshakeIfRequired() error {
 	}
 
 	// 9. Ensure a valid indicator byte.
-	if initialRemoteData[5] != 0x00 && initialRemoteData[5] != 0x01 {
+	if initialRemoteData[4] != 0x00 && initialRemoteData[4] != 0x01 {
 		return ErrInvalidHandshake
 	}
 
 	// 10. Ensure we received a signature if we are expecting one.
-	signatureProvided := initialRemoteData[5] == 0x01
+	signatureProvided := initialRemoteData[4] == 0x01
 	if srw.publicKey != nil && !signatureProvided {
 		return ErrVerificationOmitted
 	}
@@ -147,7 +148,7 @@ func (srw *SecureReadWriter) performHandshakeIfRequired() error {
 	}
 
 	// 14. Combine the sharedSecret and the hashes of the full handshake
-	// transcript to get a key.
+	// transcript to get the key material.
 	hashSent := sha256.Sum256(hsSent)
 	hashReceived := sha256.Sum256(hsReceived)
 	hashXOR := make([]byte, 32)
@@ -155,50 +156,59 @@ func (srw *SecureReadWriter) performHandshakeIfRequired() error {
 		hashXOR[i] = hashSent[i] ^ hashReceived[i]
 	}
 
-	finalHasher := sha256.New()
-	finalHasher.Write(hashXOR)
+	finalHasher := sha512.New()
 	finalHasher.Write(sharedSecret)
-	key := finalHasher.Sum(nil)
+	finalHasher.Write(hashXOR)
+	keyMaterial := finalHasher.Sum(nil)
+	nonceMaterial := sha256.Sum256(keyMaterial)
 
-	// 15. Construct an AEAD from AES-GCM to use for symmetric encryption.
-	aes, err := aes.NewCipher(key[:])
-	if err != nil {
-		return fmt.Errorf("failed to construct AES cipher from shared secret: %w", err)
+	// 15. Determine the send and receive keys, as well as the initial nonces.
+	var sendKey, receiveKey, sendNonce, receiveNonce []byte
+	if bytes.Compare(hashSent[:], hashReceived[:]) == 1 {
+		sendKey = keyMaterial[:32]
+		receiveKey = keyMaterial[32:]
+		sendNonce = nonceMaterial[:12]
+		receiveNonce = nonceMaterial[12:24]
+	} else {
+		sendKey = keyMaterial[32:]
+		receiveKey = keyMaterial[:32]
+		sendNonce = nonceMaterial[12:24]
+		receiveNonce = nonceMaterial[:12]
 	}
 
-	aead, err := cipher.NewGCM(aes)
+	// 16. Construct AEAD's from AES-GCM to use for symmetric encryption.
+	sendAES, err := aes.NewCipher(sendKey)
 	if err != nil {
-		return fmt.Errorf("failed to construct GCM AEAD from AES cipher: %w", err)
+		return fmt.Errorf("failed to construct send AES cipher from key material: %w", err)
 	}
 
-	nonce, err := generateNonce()
+	receiveAES, err := aes.NewCipher(receiveKey)
 	if err != nil {
-		return fmt.Errorf("failed to generate a nonce: %w", err)
+		return fmt.Errorf("failed to construct receive AES cipher from key material: %w", err)
 	}
 
-	srw.aead = aead
-	srw.nonce = nonce
+	sendAEAD, err := cipher.NewGCM(sendAES)
+	if err != nil {
+		return fmt.Errorf("failed to construct send GCM AEAD from AES cipher: %w", err)
+	}
+
+	receiveAEAD, err := cipher.NewGCM(receiveAES)
+	if err != nil {
+		return fmt.Errorf("failed to construct receive GCM AEAD from AES cipher: %w", err)
+	}
+
+	srw.sendAEAD = sendAEAD
+	srw.receiveAEAD = receiveAEAD
+	srw.sendNonce = sendNonce
+	srw.receiveNonce = receiveNonce
 
 	return nil
-}
-
-func generateNonce() ([]byte, error) {
-	nonce := make([]byte, 12)
-	if _, err := io.ReadAtLeast(rand.Reader, nonce[:8], 8); err != nil {
-		return nil, err
-	}
-
-	return nonce, nil
 }
 
 func increaseNonce(nonce []byte) error {
 	ind := 11
 
 	for {
-		if ind == 7 {
-			return ErrNonceExhaustion
-		}
-
 		if nonce[ind] != 255 {
 			nonce[ind]++
 			return nil
@@ -210,32 +220,29 @@ func increaseNonce(nonce []byte) error {
 }
 
 func encrypt(aead cipher.AEAD, nonce, plaintext []byte, w io.Writer) error {
-	ciphertextLengthRaw := binary.BigEndian.AppendUint32(nil, uint32(len(plaintext))+16)
+	ciphertextLengthRaw := binary.BigEndian.AppendUint16(nil, uint16(len(plaintext))+16)
 	ciphertext := aead.Seal(nil, nonce, plaintext, ciphertextLengthRaw)
-	ciphertextAndNonce := append(ciphertextLengthRaw, append(nonce, ciphertext...)...)
+	ciphertextAndNonce := append(ciphertextLengthRaw, ciphertext...)
 
 	_, err := w.Write(ciphertextAndNonce)
 	return err
 }
 
-func decrypt(aead cipher.AEAD, r io.Reader) ([]byte, error) {
-	lengthAndNonce := make([]byte, 16)
-	_, err := io.ReadAtLeast(r, lengthAndNonce, len(lengthAndNonce))
+func decrypt(aead cipher.AEAD, nonce []byte, r io.Reader) ([]byte, error) {
+	rawLength := make([]byte, 2)
+	_, err := io.ReadAtLeast(r, rawLength, len(rawLength))
 	if err != nil {
 		return nil, err
 	}
 
-	ciphertextLengthRaw := lengthAndNonce[:4]
-	ciphertextLength := int(binary.BigEndian.Uint32(ciphertextLengthRaw))
-	nonce := lengthAndNonce[4:]
-
-	ciphertext := make([]byte, ciphertextLength)
+	length := int(binary.BigEndian.Uint16(rawLength))
+	ciphertext := make([]byte, length)
 	_, err = io.ReadAtLeast(r, ciphertext, len(ciphertext))
 	if err != nil {
 		return nil, err
 	}
 
-	plaintext, err := aead.Open(nil, nonce, ciphertext, ciphertextLengthRaw)
+	plaintext, err := aead.Open(nil, nonce, ciphertext, rawLength)
 	if err != nil {
 		return nil, err
 	}

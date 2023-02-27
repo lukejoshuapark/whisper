@@ -62,3 +62,92 @@ srw := whisper.NewSecureReadWriterWithPrivateAndPublicKey(conn, localPrivateKey,
 lineReader := bufio.NewReader(srw)
 line, _ := lineReader.ReadString('\n')
 ```
+
+## Protocol
+
+The `whisper` protocol uses Ed25519 and X25519 to complete key exchange and
+AES-GCM for subsequent encryption of data.
+
+### Key Exchange
+
+Handshaking under the `whisper` protocol only requires a single payload sent in
+each direction.  It does not matter which side of the tunnel sends its payload
+first and they may be sent asynchronously.
+
+The `whisper` protocol can be utilized in two different modes:
+
+- **Exclusive** - One side of the tunnel holds a Ed25519 Private Key and the
+other side holds the corresponding Ed25519 Public Key.  This is similar to how
+most typical TLS connections are established e.g. one-sided trust.
+
+- **Mutual** - Both sides of the tunnel hold their own Ed25519 Private Key and
+the opposing side's Ed25519 Public Key.
+
+Regardless of the mode of operation, each side of the connection will first
+begin by generating a set of ephemeral X25519 keys.  However, the initial
+handshake payload will vary.
+
+When using **Exclusive** mode, the side of the tunnel that holds the private key
+will send:
+
+```
+4  bytes (UTF-8 "WHSP")
+1  byte  0x01
+64 bytes The signature computed over the generated X25519 Public Key
+32 bytes The generated X25519 Public Key
+```
+
+Whereas the side that holds the public key will send:
+
+```
+4  bytes (UTF-8 "WHSP")
+1  byte  0x01
+32 bytes The generated X25519 Public Key
+```
+
+When using **Mutual** mode, both sides of the tunnel will send the payload that
+includes the signature of the generated X25519 Public Key.
+
+Any signatures included are verified before continuing.  Further, a SHA-256 hash
+of the outgoing handshake payload and a SHA-256 hash of the incoming handshake
+payload are computed and stored.
+
+### Key Generation
+
+Next, the X25519 shared secret is calculated.  The two handshake payload hashes
+computed in the previous step are XOR'd together, appended to the shared secret,
+then hashed with SHA-512 to get 64 bytes of key material.
+
+The two handshake payload hashes are then compared.  The side of the tunnel that
+produced the larger of the two hashes (big-endian) will use the first 32 bytes
+of key material to **encrypt** messages, and the remaining 32 bytes to
+**decrypt** messages.
+
+The 64 bytes of key material are then hashed with SHA-256.  The first 24 bytes
+are the initial nonces.  The same rule applies for which side of the tunnel will
+use the first 12 bytes as a nonce when encrypting and which side will use the
+subsequent 12 bytes.
+
+### Data Encryption
+
+The `whisper` protocol exchanges data in "messages" that are no more than 65,519
+bytes in size.  Messages larger than this amount are broken up and the steps
+below are repeated for each segment.  When one side of the tunnel wants to send
+a message, it:
+
+- Determines the length of the ciphertext for the provided plaintext.
+- Converts this length to an unsigned, big-endian 16-bit integer.
+- Encrypts the plaintext using AES-GCM with the correct key and nonce, and
+includes the 16-bit integer as additional authenticated data.
+- Transmits the 16-bit integer and the ciphertext to the remote party.
+- Increments the corresponding nonce.
+
+When one side of the tunnel wants to receive a message, it:
+
+- Waits for at least 16 bits of data to be available and reads them.
+- Allocates a buffer of the size specified in those 16 bits.
+- Waits for that buffer to fill.
+- Decrypts the ciphertext using AES-GCM with the correct key and nonce, and
+includes the 16 bits of ciphertext length as additional authenticated data.
+- Provides the data back to the caller.
+- Increments the corresponding nonce.
